@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+env/
+venv/
+*.egg-info/
+.tox/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and Data
+logs/
+data/
+*.out
+*.pid
+dumpsys_cpuinfo_output.txt
+dumpsys_meminfo_output.txt
+
+# PyInstaller build files
+build/
+dist/
+dist_build/
+release/
+*.spec
+
+# Environment variables
+.env
