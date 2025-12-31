@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Android App 性能数据采集器
+专注于应用级指标：CPU、内存、FPS
+"""
+
 import csv
 import os
 import signal
@@ -15,8 +21,8 @@ def load_config():
         "adb_serial": os.getenv("ADB_SERIAL", ""),
         "interval": float(os.getenv("SAMPLE_INTERVAL_SECONDS", "1.0")),
         "app_package": os.getenv("APP_PACKAGE", ""),
-        "data_dir": os.getenv("DATA_DIR", "/Users/xujinliang/Desktop/AndroidPerfMon/data"),
-        "log_dir": os.getenv("LOG_DIR", "/Users/xujinliang/Desktop/AndroidPerfMon/logs"),
+        "data_dir": os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")),
+        "log_dir": os.getenv("LOG_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")),
     }
     os.makedirs(config["data_dir"], exist_ok=True)
     os.makedirs(config["log_dir"], exist_ok=True)
@@ -29,148 +35,156 @@ def adb_shell(command_parts, adb_serial):
         base += ["-s", adb_serial]
     base += ["shell"] + command_parts
     try:
-        out = subprocess.check_output(base, stderr=subprocess.STDOUT)
+        out = subprocess.check_output(base, stderr=subprocess.STDOUT, timeout=10)
         return out.decode("utf-8", errors="ignore")
     except subprocess.CalledProcessError as e:
         return e.output.decode("utf-8", errors="ignore")
+    except subprocess.TimeoutExpired:
+        return ""
 
 
-def parse_total_cpu_percent(text):
-    # Try dumpsys cpuinfo style lines containing TOTAL/Total
-    percent = None
-    for line in text.splitlines():
-        if "TOTAL" in line or line.strip().startswith("Total"):
-            # find first number before %
-            tokens = [t for t in line.replace("/", " ").replace(",", " ").split() if t]
-            for tok in tokens:
-                if tok.endswith("%") and tok[:-1].replace(".", "", 1).isdigit():
-                    try:
-                        percent = float(tok[:-1])
-                        return percent
-                    except Exception:
-                        pass
-    # Try top summary line: "CPU usage from ...: 3% user + 2% kernel ..."
-    for line in text.splitlines():
-        if "CPU usage from" in line and "%" in line:
-            nums = []
-            for part in line.split():
-                if part.endswith("%") and part[:-1].replace(".", "", 1).isdigit():
-                    try:
-                        nums.append(float(part[:-1]))
-                    except Exception:
-                        pass
-            if nums:
-                return sum(nums)
-    return percent
-
-
-def parse_meminfo(text):
-    mem_total = None
-    mem_available = None
-    for line in text.splitlines():
-        if line.startswith("MemTotal:"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                mem_total = int(parts[1])
-        elif line.startswith("MemAvailable:"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                mem_available = int(parts[1])
-    mem_used_percent = None
-    if mem_total and mem_available is not None and mem_total > 0:
-        mem_used_percent = (1.0 - (mem_available / float(mem_total))) * 100.0
-    return mem_total, mem_available, mem_used_percent
-
-
-def parse_battery(text):
-    level = None
-    temp_c = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.lower().startswith("level:"):
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                val = parts[1].strip()
-                if val.isdigit():
-                    level = int(val)
-        elif line.lower().startswith("temperature:"):
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                raw = parts[1].strip()
-                try:
-                    tenths = int(raw)
-                    temp_c = tenths / 10.0
-                except Exception:
-                    pass
-    return level, temp_c
-
-
-def parse_app_cpu_from_cpuinfo(text, package_name):
+def parse_app_cpu_from_top(text, package_name):
+    """
+    从 top 命令解析应用 CPU 占用（更准确）
+    top 输出格式: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ ARGS
+    """
     if not package_name:
         return None
-    best = None
+    
     for line in text.splitlines():
-        # Look for lines like: "  16% 23856/com.rokid.sprite.global.aiapp: ..."
-        if package_name in line and "%" in line:
-            parts = line.strip().split()
-            if len(parts) > 0 and parts[0].endswith("%"):
+        if package_name in line:
+            parts = line.split()
+            # top 输出通常是: PID USER ... %CPU %MEM ... COMMAND
+            # 找到包含数字和%的列
+            for i, part in enumerate(parts):
+                # 跳过 PID（第一列纯数字）
+                if i == 0:
+                    continue
+                # CPU 通常在第 8 或 9 列，是一个数字
                 try:
-                    val = float(parts[0][:-1])
-                    return val  # Return the first percentage found in the line
+                    val = float(part)
+                    # CPU 值通常在 0-100+ 范围，排除 PID 等大数字
+                    if 0 <= val <= 800:  # 多核可能超过 100
+                        return val
                 except ValueError:
                     continue
-    return best
+    return None
 
 
-def parse_app_mem_from_meminfo(text):
-    # Look for line starts with TOTAL after "Applications Memory Usage (in Kilobytes):"
+def parse_app_mem(text):
+    """从 dumpsys meminfo 解析应用内存 (PSS)"""
     for line in text.splitlines():
-        if line.strip().startswith("TOTAL"):
+        line = line.strip()
+        if line.startswith("TOTAL") and "TOTAL:" not in line:
             parts = line.split()
-            # common format: TOTAL PSS: <kb> ... or just TOTAL <kb>
-            for part in parts:
+            for part in parts[1:]:
                 if part.isdigit():
                     return int(part)
     return None
 
 
+def parse_fps_from_gfxinfo(text):
+    """
+    从 dumpsys gfxinfo 解析 FPS 相关数据
+    返回: (total_frames, janky_frames, jank_rate)
+    """
+    total_frames = None
+    janky_frames = None
+    
+    for line in text.splitlines():
+        line = line.strip()
+        # Total frames rendered: 12345
+        if "Total frames rendered:" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                try:
+                    total_frames = int(parts[1].strip())
+                except ValueError:
+                    pass
+        # Janky frames: 123 (1.00%)
+        elif "Janky frames:" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                val = parts[1].strip().split()[0]
+                try:
+                    janky_frames = int(val)
+                except ValueError:
+                    pass
+    
+    # 计算卡顿率（只有帧数足够多时才计算，避免静止界面误报）
+    jank_rate = None
+    if total_frames and total_frames >= 10 and janky_frames is not None:
+        jank_rate = (janky_frames / total_frames) * 100
+    
+    return total_frames, janky_frames, jank_rate
+
+
+def parse_frame_stats(text):
+    """
+    解析 framestats 计算实时 FPS
+    framestats 格式: 每行是一帧的时间戳数据
+    """
+    frame_times = []
+    in_stats = False
+    
+    for line in text.splitlines():
+        line = line.strip()
+        if "---PROFILEDATA---" in line:
+            in_stats = True
+            continue
+        if in_stats and line and not line.startswith("Flags"):
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    # 第一列是 Flags，第二列是 IntendedVsync
+                    intended_vsync = int(parts[1])
+                    if intended_vsync > 0:
+                        frame_times.append(intended_vsync)
+                except (ValueError, IndexError):
+                    pass
+    
+    # 计算 FPS
+    if len(frame_times) >= 2:
+        # 时间单位是纳秒
+        duration_ns = frame_times[-1] - frame_times[0]
+        if duration_ns > 0:
+            duration_s = duration_ns / 1e9
+            fps = (len(frame_times) - 1) / duration_s
+            return min(fps, 120)  # 限制最大值
+    
+    return None
+
+
 def collect_once(cfg):
+    """采集一次数据"""
     serial = cfg["adb_serial"]
-
-    cpuinfo = adb_shell(["dumpsys", "cpuinfo"], serial)
-    total_cpu = parse_total_cpu_percent(cpuinfo)
-
-    # Fallback with top if needed
-    if total_cpu is None:
-        top_out = adb_shell(["top", "-n", "1", "-b"], serial)
-        total_cpu = parse_total_cpu_percent(top_out)
-
-    meminfo_out = adb_shell(["cat", "/proc/meminfo"], serial)
-    mem_total, mem_available, mem_used_percent = parse_meminfo(meminfo_out)
-
-    battery_out = adb_shell(["dumpsys", "battery"], serial)
-    battery_level, battery_temp_c = parse_battery(battery_out)
-
-    app_cpu = None
-    app_mem = None
-    if cfg["app_package"]:
-        print(f"[DEBUG] APP_PACKAGE: {cfg['app_package']}")
-        cpuinfo = adb_shell(["dumpsys", "cpuinfo"], serial)
-        app_cpu = parse_app_cpu_from_cpuinfo(cpuinfo, cfg["app_package"])
-        print(f"[DEBUG] Parsed app_cpu: {app_cpu}")
-        app_meminfo = adb_shell(["dumpsys", "meminfo", cfg["app_package"]], serial)
-        app_mem = parse_app_mem_from_meminfo(app_meminfo)
-
+    package = cfg["app_package"]
+    
+    if not package:
+        print("[WARN] APP_PACKAGE 未配置")
+        return None
+    
+    # 应用 CPU（使用 top 命令，更准确）
+    top_output = adb_shell(["top", "-n", "1", "-b"], serial)
+    app_cpu = parse_app_cpu_from_top(top_output, package)
+    
+    # 应用内存
+    meminfo = adb_shell(["dumpsys", "meminfo", package], serial)
+    app_mem = parse_app_mem(meminfo)
+    
+    # FPS 和卡顿
+    gfxinfo = adb_shell(["dumpsys", "gfxinfo", package, "framestats"], serial)
+    total_frames, janky_frames, jank_rate = parse_fps_from_gfxinfo(gfxinfo)
+    fps = parse_frame_stats(gfxinfo)
+    
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "total_cpu_percent": total_cpu,
-        "mem_total_kb": mem_total,
-        "mem_available_kb": mem_available,
-        "mem_used_percent": mem_used_percent,
-        "battery_level": battery_level,
-        "battery_temp_c": battery_temp_c,
         "app_cpu_percent": app_cpu,
         "app_mem_kb": app_mem,
+        "fps": round(fps, 1) if fps else None,
+        "total_frames": total_frames,
+        "janky_frames": janky_frames,
+        "jank_rate": round(jank_rate, 2) if jank_rate else None,
     }
 
 
@@ -181,14 +195,12 @@ def ensure_csv_writer(csv_path):
         f,
         fieldnames=[
             "timestamp",
-            "total_cpu_percent",
-            "mem_total_kb",
-            "mem_available_kb",
-            "mem_used_percent",
-            "battery_level",
-            "battery_temp_c",
             "app_cpu_percent",
             "app_mem_kb",
+            "fps",
+            "total_frames",
+            "janky_frames",
+            "jank_rate",
         ],
     )
     if is_new:
@@ -203,6 +215,14 @@ def write_pid(pid_path):
 
 def main():
     cfg = load_config()
+    
+    if not cfg["app_package"]:
+        print("[ERROR] 请在 .env 中配置 APP_PACKAGE")
+        sys.exit(1)
+    
+    print(f"[INFO] 开始采集: {cfg['app_package']}")
+    print(f"[INFO] 采集间隔: {cfg['interval']}s")
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(cfg["data_dir"], f"metrics_{timestamp}.csv")
     pid_path = os.path.join(cfg["log_dir"], "collector.pid")
@@ -221,12 +241,14 @@ def main():
     try:
         while not stop_requested:
             row = collect_once(cfg)
-            writer.writerow(row)
-            file_handle.flush()
-            time.sleep(max(0.05, cfg["interval"]))
+            if row:
+                writer.writerow(row)
+                file_handle.flush()
+                print(f"[DATA] CPU: {row['app_cpu_percent']}%, MEM: {row['app_mem_kb']}KB, FPS: {row['fps']}")
+            time.sleep(max(0.1, cfg["interval"]))
     finally:
         file_handle.close()
-        # do not remove pid on exit to allow post-mortem. stop script will clean.
+        print(f"\n[INFO] 数据已保存: {csv_path}")
 
 
 if __name__ == "__main__":
@@ -234,4 +256,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
-

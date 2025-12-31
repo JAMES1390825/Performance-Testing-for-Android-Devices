@@ -18,8 +18,9 @@ def run_visualizer():
         STREAMLIT_EXECUTABLE,
         "run",
         os.path.join(PROJECT_DIR, "visualizer", "app.py"),
-        "--server.address", "0.0.0.0", # Listen on all network interfaces
-        "--server.port", "8501"      # Default Streamlit port
+        "--server.address", "localhost",
+        "--server.port", "8501",
+        "--browser.serverAddress", "localhost"
     ]
 
     # Ensure the virtual environment's python is used if not already in path
